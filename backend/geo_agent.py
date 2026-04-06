@@ -3,6 +3,7 @@ import json
 import os
 import re
 from collections import Counter
+from urllib.parse import quote_plus
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -19,8 +20,10 @@ PLATFORMS = {
     "bing": "https://www.bing.com/search?q=",
 }
 
-QUERY_TIMEOUT = 90
-PLATFORM_TIMEOUT = 100
+# Timeouts
+QUERY_TIMEOUT = 120          # per-query: 2 min (some platforms are slow)
+PLATFORM_TIMEOUT = 300       # per-platform: 5 min (3 queries + retries)
+MAX_RETRIES = 1              # retry failed/timeout queries once
 
 
 def generate_queries(brand: str) -> list:
@@ -53,7 +56,7 @@ Example for Nike: ["best running shoes 2025", "top athletic footwear brands comp
             raise ValueError(f"Unexpected query format: {parsed}")
         return parsed
     except Exception as e:
-        print(f"Query generation fallback: {type(e).__name__}")
+        print(f"[generate_queries] fallback: {type(e).__name__}")
         return ["best products in this category 2025", "top brands comparison review", "most recommended options for everyday use"]
 
 
@@ -68,50 +71,133 @@ def validate_brand(brand: str) -> str:
 
 
 def _build_url(platform: str, query: str) -> str:
-    """Build search URL with query embedded, so the agent only needs to read results."""
-    from urllib.parse import quote_plus
+    """Build search URL with query embedded so the agent only reads results."""
     return PLATFORMS[platform] + quote_plus(query)
 
 
-async def scan_single_query(platform: str, brand: str, query: str) -> dict:
+def _parse_agent_result(raw, query: str) -> dict:
+    """Parse TinyFish agent result into a normalized dict.
+
+    TinyFish returns results in multiple formats depending on the platform:
+      - dict with mentioned/snippet directly: {"mentioned": true, "snippet": "..."}
+      - dict wrapped: {"result": "```json\n{...}\n```"}
+      - string: '{"mentioned": true, ...}'
+      - string with markdown: '```json\n{"mentioned": true}\n```'
+      - dict with narrative + embedded JSON: {"result": "some text... ```json\n{...}```"}
+    """
+    if not raw:
+        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
+
+    parsed = None
+
+    # Case 1: raw is already a dict with "mentioned" key
+    if isinstance(raw, dict) and "mentioned" in raw:
+        parsed = raw
+
+    # Case 2: raw is a dict with a "result" key containing a string
+    elif isinstance(raw, dict) and "result" in raw:
+        inner = raw["result"]
+        if isinstance(inner, str):
+            parsed = _extract_json_from_string(inner)
+        elif isinstance(inner, dict) and "mentioned" in inner:
+            parsed = inner
+
+    # Case 3: raw is a string containing JSON
+    elif isinstance(raw, str):
+        parsed = _extract_json_from_string(raw)
+
+    if not parsed or "mentioned" not in parsed:
+        # Last resort: check if the raw text itself contains the brand name
+        raw_str = json.dumps(raw) if isinstance(raw, dict) else str(raw)
+        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
+
+    return {
+        "query": query,
+        "mentioned": bool(parsed.get("mentioned", False)),
+        "snippet": parsed.get("snippet"),
+        "sentiment": parsed.get("sentiment", "neutral"),
+    }
+
+
+def _extract_json_from_string(text: str) -> dict | None:
+    """Extract a JSON object from a string that may contain markdown fences or narrative."""
+    # Strip markdown fences
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        # Find the last ``` block (narrative text often precedes the JSON)
+        parts = text.split("```")
+        for i in range(len(parts) - 1, 0, -1):
+            candidate = parts[i].strip()
+            if candidate.startswith("{"):
+                text = candidate
+                break
+        else:
+            text = parts[1].strip() if len(parts) > 1 else text
+
+    # Try direct parse
     try:
-        url = _build_url(platform, query)
-        response = await asyncio.wait_for(
-            client.agent.run(
-                url=url,
-                goal=f'Read the response on this page. Is the brand "{brand}" mentioned anywhere? Answer JSON only: {{"mentioned": true, "snippet": "exact sentence mentioning {brand}", "sentiment": "positive or neutral or negative"}} or {{"mentioned": false, "snippet": null, "sentiment": "neutral"}}',
-            ),
-            timeout=QUERY_TIMEOUT,
-        )
-        raw = response.result
-        if not raw:
-            return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
 
-        # Handle both dict and string responses
-        if isinstance(raw, str):
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            raw = json.loads(raw)
-        elif isinstance(raw, dict) and "result" in raw and isinstance(raw["result"], str):
-            inner = raw["result"].replace("```json", "").replace("```", "").strip()
-            raw = json.loads(inner)
+    # Try to find a JSON object anywhere in the text
+    match = re.search(r'\{[^{}]*"mentioned"\s*:\s*(true|false)[^{}]*\}', text, re.IGNORECASE)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-        return {
-            "query": query,
-            "mentioned": bool(raw.get("mentioned", False)),
-            "snippet": raw.get("snippet"),
-            "sentiment": raw.get("sentiment", "neutral"),
-        }
-    except asyncio.TimeoutError:
-        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "timeout"}
-    except Exception:
-        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "scan_failed"}
+    return None
+
+
+async def _run_single_scan(platform: str, brand: str, query: str) -> dict:
+    """Execute a single TinyFish scan (no retry logic)."""
+    url = _build_url(platform, query)
+    response = await asyncio.wait_for(
+        client.agent.run(
+            url=url,
+            goal=f'Read this page. Is "{brand}" mentioned? JSON only: {{"mentioned": true, "snippet": "exact sentence", "sentiment": "positive/neutral/negative"}} or {{"mentioned": false, "snippet": null, "sentiment": "neutral"}}',
+        ),
+        timeout=QUERY_TIMEOUT,
+    )
+    return _parse_agent_result(response.result, query)
+
+
+async def scan_single_query(platform: str, brand: str, query: str) -> dict:
+    """Scan a single query on a platform with retry on failure."""
+    last_error = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            result = await _run_single_scan(platform, brand, query)
+            # If we got an actual result (not an error), return it
+            if "error" not in result:
+                if attempt > 0:
+                    print(f"[retry] {platform}/{query[:30]}... succeeded on attempt {attempt + 1}")
+                return result
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            print(f"[timeout] {platform}/{query[:30]}... attempt {attempt + 1}/{1 + MAX_RETRIES}")
+        except Exception as e:
+            last_error = "scan_failed"
+            print(f"[error] {platform}/{query[:30]}... attempt {attempt + 1}: {type(e).__name__}")
+
+        # Brief pause before retry
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(2)
+
+    return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": last_error or "failed"}
 
 
 async def scan_platform(platform: str, brand: str, queries: list) -> dict:
+    """Scan all queries for a single platform in parallel."""
     query_results = await asyncio.gather(
         *[scan_single_query(platform, brand, q) for q in queries],
         return_exceptions=True
     )
+
     clean_results = []
     for i, r in enumerate(query_results):
         if isinstance(r, Exception):
@@ -120,6 +206,7 @@ async def scan_platform(platform: str, brand: str, queries: list) -> dict:
             clean_results.append(r)
 
     mentions = [r for r in clean_results if r.get("mentioned")]
+    errors = [r for r in clean_results if r.get("error")]
     total_queries = len(queries)
     mention_rate = int((len(mentions) / total_queries) * 100) if total_queries > 0 else 0
     snippets = [r.get("snippet") for r in mentions if r.get("snippet")]
@@ -128,6 +215,8 @@ async def scan_platform(platform: str, brand: str, queries: list) -> dict:
     if mentions:
         sentiments = [r.get("sentiment", "neutral") for r in mentions if r.get("sentiment")]
         sentiment = Counter(sentiments).most_common(1)[0][0] if sentiments else "positive"
+    elif errors and len(errors) == total_queries:
+        sentiment = "neutral"  # all failed = unknown, not negative
     else:
         sentiment = "negative"
 
@@ -142,6 +231,7 @@ async def scan_platform(platform: str, brand: str, queries: list) -> dict:
         "context": f"{brand} appeared in {len(mentions)} out of {total_queries} category searches on {platform}",
         "snippet": snippets[0] if snippets else None,
         "query_results": clean_results,
+        "errors": len(errors),
     }
 
 
@@ -149,6 +239,7 @@ async def scan_platform_with_timeout(platform: str, brand: str, queries: list) -
     try:
         return await asyncio.wait_for(scan_platform(platform, brand, queries), timeout=PLATFORM_TIMEOUT)
     except asyncio.TimeoutError:
+        print(f"[platform_timeout] {platform} timed out after {PLATFORM_TIMEOUT}s")
         return {
             "platform": platform,
             "brand": brand,
@@ -160,4 +251,5 @@ async def scan_platform_with_timeout(platform: str, brand: str, queries: list) -
             "context": "Platform scan timed out",
             "snippet": None,
             "query_results": [],
+            "errors": 3,
         }
