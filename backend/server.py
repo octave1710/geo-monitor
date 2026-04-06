@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from geo_agent import scan_platform_with_timeout, generate_queries, validate_brand, PLATFORMS
+from geo_agent import scan_platform_with_timeout, generate_queries, generate_brand_aliases, validate_brand, PLATFORMS
 from synthesizer import compute_score
 
 app = FastAPI()
@@ -132,10 +132,14 @@ async def scan_brand(brand: str, demo: bool = Query(default=False)):
         yield f"data: {json.dumps({'type': 'started', 'platforms': list(PLATFORMS.keys())})}\n\n"
 
         loop = asyncio.get_event_loop()
-        queries = await loop.run_in_executor(None, generate_queries, brand)
+        queries, aliases = await asyncio.gather(
+            loop.run_in_executor(None, generate_queries, brand),
+            loop.run_in_executor(None, generate_brand_aliases, brand),
+        )
+        print(f"[scan] brand={brand}, aliases={aliases}")
         yield f"data: {json.dumps({'type': 'queries', 'queries': queries})}\n\n"
 
-        tasks = {p: asyncio.create_task(scan_platform_with_timeout(p, brand, queries)) for p in PLATFORMS}
+        tasks = {p: asyncio.create_task(scan_platform_with_timeout(p, brand, queries, aliases)) for p in PLATFORMS}
 
         results = []
         pending = set(tasks.values())

@@ -60,6 +60,41 @@ Example for Nike: ["best running shoes 2025", "top athletic footwear brands comp
         return ["best products in this category 2025", "top brands comparison review", "most recommended options for everyday use"]
 
 
+def generate_brand_aliases(brand: str) -> list:
+    """Generate sub-brands, product lines, and aliases for a brand using Claude."""
+    try:
+        msg = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"""List the sub-brands, product line names, and common aliases for "{brand}" that might appear in search results instead of the main brand name.
+
+Examples:
+- Xiaomi → ["Redmi", "Poco", "Mi"]
+- Alphabet → ["Google", "Waymo", "DeepMind"]
+- Meta → ["Facebook", "Instagram", "WhatsApp"]
+- Nike → ["Jordan", "Air Max", "Converse"]
+- Apple → ["iPhone", "iPad", "MacBook", "AirPods"]
+
+Return ONLY a JSON array of strings. If the brand has no well-known sub-brands, return an empty array [].
+Do NOT include the main brand name itself."""
+            }]
+        )
+        raw_text = msg.content[0].text
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```", 1)[1].split("```", 1)[0].strip()
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, list) and all(isinstance(a, str) for a in parsed):
+            return parsed[:10]  # cap at 10 aliases
+        return []
+    except Exception as e:
+        print(f"[generate_brand_aliases] fallback: {type(e).__name__}")
+        return []
+
+
 def validate_brand(brand: str) -> str:
     """Validate and sanitize brand name input."""
     brand = brand.strip()
@@ -152,26 +187,32 @@ def _extract_json_from_string(text: str) -> dict | None:
     return None
 
 
-async def _run_single_scan(platform: str, brand: str, query: str) -> dict:
+async def _run_single_scan(platform: str, brand: str, query: str, aliases: list) -> dict:
     """Execute a single TinyFish scan (no retry logic)."""
     url = _build_url(platform, query)
+
+    # Build the brand search terms: main brand + aliases
+    search_terms = [brand] + aliases
+    terms_str = '" or "'.join(search_terms)
+
     response = await asyncio.wait_for(
         client.agent.run(
             url=url,
-            goal=f'Read this page. Is "{brand}" mentioned? JSON only: {{"mentioned": true, "snippet": "exact sentence", "sentiment": "positive/neutral/negative"}} or {{"mentioned": false, "snippet": null, "sentiment": "neutral"}}',
+            goal=f'Read this page. Is "{terms_str}" mentioned anywhere? JSON only: {{"mentioned": true, "snippet": "exact sentence", "sentiment": "positive/neutral/negative"}} or {{"mentioned": false, "snippet": null, "sentiment": "neutral"}}',
         ),
         timeout=QUERY_TIMEOUT,
     )
     return _parse_agent_result(response.result, query)
 
 
-async def scan_single_query(platform: str, brand: str, query: str) -> dict:
+async def scan_single_query(platform: str, brand: str, query: str, aliases: list | None = None) -> dict:
     """Scan a single query on a platform with retry on failure."""
     last_error = None
+    aliases = aliases or []
 
     for attempt in range(1 + MAX_RETRIES):
         try:
-            result = await _run_single_scan(platform, brand, query)
+            result = await _run_single_scan(platform, brand, query, aliases)
             # If we got an actual result (not an error), return it
             if "error" not in result:
                 if attempt > 0:
@@ -191,10 +232,10 @@ async def scan_single_query(platform: str, brand: str, query: str) -> dict:
     return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": last_error or "failed"}
 
 
-async def scan_platform(platform: str, brand: str, queries: list) -> dict:
+async def scan_platform(platform: str, brand: str, queries: list, aliases: list | None = None) -> dict:
     """Scan all queries for a single platform in parallel."""
     query_results = await asyncio.gather(
-        *[scan_single_query(platform, brand, q) for q in queries],
+        *[scan_single_query(platform, brand, q, aliases) for q in queries],
         return_exceptions=True
     )
 
@@ -235,9 +276,9 @@ async def scan_platform(platform: str, brand: str, queries: list) -> dict:
     }
 
 
-async def scan_platform_with_timeout(platform: str, brand: str, queries: list) -> dict:
+async def scan_platform_with_timeout(platform: str, brand: str, queries: list, aliases: list | None = None) -> dict:
     try:
-        return await asyncio.wait_for(scan_platform(platform, brand, queries), timeout=PLATFORM_TIMEOUT)
+        return await asyncio.wait_for(scan_platform(platform, brand, queries, aliases), timeout=PLATFORM_TIMEOUT)
     except asyncio.TimeoutError:
         print(f"[platform_timeout] {platform} timed out after {PLATFORM_TIMEOUT}s")
         return {
