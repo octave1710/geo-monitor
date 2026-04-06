@@ -14,9 +14,9 @@ client = AsyncTinyFish()
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 PLATFORMS = {
-    "perplexity": "https://perplexity.ai",
-    "chatgpt": "https://chatgpt.com",
-    "bing": "https://bing.com",
+    "perplexity": "https://www.perplexity.ai/search?q=",
+    "chatgpt": "https://chatgpt.com/?q=",
+    "bing": "https://www.bing.com/search?q=",
 }
 
 QUERY_TIMEOUT = 90
@@ -67,28 +67,40 @@ def validate_brand(brand: str) -> str:
     return brand
 
 
+def _build_url(platform: str, query: str) -> str:
+    """Build search URL with query embedded, so the agent only needs to read results."""
+    from urllib.parse import quote_plus
+    return PLATFORMS[platform] + quote_plus(query)
+
+
 async def scan_single_query(platform: str, brand: str, query: str) -> dict:
     try:
+        url = _build_url(platform, query)
         response = await asyncio.wait_for(
             client.agent.run(
-                url=PLATFORMS[platform],
-                goal=f"Search for '{query}'. When results fully load, read the ENTIRE response carefully. Check if '{brand}' is mentioned anywhere in the text. Return only JSON: {{\"mentioned\": true/false, \"snippet\": \"exact sentence mentioning {brand} or null\", \"sentiment\": \"positive or neutral or negative based on the tone of the mention\"}}"
+                url=url,
+                goal=f'Read the response on this page. Is the brand "{brand}" mentioned anywhere? Answer JSON only: {{"mentioned": true, "snippet": "exact sentence mentioning {brand}", "sentiment": "positive or neutral or negative"}} or {{"mentioned": false, "snippet": null, "sentiment": "neutral"}}',
             ),
-            timeout=QUERY_TIMEOUT
+            timeout=QUERY_TIMEOUT,
         )
         raw = response.result
         if not raw:
             return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
+
+        # Handle both dict and string responses
         if isinstance(raw, str):
             raw = raw.replace("```json", "").replace("```", "").strip()
-            result = json.loads(raw)
-            return {
-                "query": query,
-                "mentioned": bool(result.get("mentioned", False)),
-                "snippet": result.get("snippet"),
-                "sentiment": result.get("sentiment", "neutral"),
-            }
-        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
+            raw = json.loads(raw)
+        elif isinstance(raw, dict) and "result" in raw and isinstance(raw["result"], str):
+            inner = raw["result"].replace("```json", "").replace("```", "").strip()
+            raw = json.loads(inner)
+
+        return {
+            "query": query,
+            "mentioned": bool(raw.get("mentioned", False)),
+            "snippet": raw.get("snippet"),
+            "sentiment": raw.get("sentiment", "neutral"),
+        }
     except asyncio.TimeoutError:
         return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "timeout"}
     except Exception:
