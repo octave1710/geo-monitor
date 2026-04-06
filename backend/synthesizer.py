@@ -1,22 +1,28 @@
 import json
+import os
+
 import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-import os
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+
 def compute_score(results: list, brand: str) -> dict:
-    clean = [r for r in results if "error" not in r]
+    clean = [r for r in results if r.get("queries_tested", 0) > 0]
 
     if not clean:
         return {
             "visibility_score": 0,
             "platforms_present": [],
-            "platforms_absent": list([r.get("platform", "unknown") for r in results]),
+            "platforms_absent": [r.get("platform", "unknown") for r in results],
             "dominant_sentiment": "neutral",
             "summary": "No data could be retrieved for this brand.",
+            "platform_analyses": [
+                {"platform": r.get("platform", "unknown"), "verdict": "weak", "analysis": "No data retrieved."}
+                for r in results
+            ],
             "geo_recommendations": [
                 "Check if brand has an online presence",
                 "Create content optimized for AI search",
@@ -64,14 +70,20 @@ Return ONLY valid JSON, no other text:
             raw_text = raw_text.split("```", 1)[1].split("```", 1)[0].strip()
         return json.loads(raw_text)
     except Exception as e:
-        print(f"Synthesizer fallback due to error: {e}")
+        print(f"Synthesizer fallback: {type(e).__name__}")
         return {
-            "visibility_score": 65,
-            "platforms_present": [r.get("platform") for r in results if "error" not in r],
-            "platforms_absent": [r.get("platform") for r in results if "error" in r],
+            "visibility_score": 0,
+            "platforms_present": [r.get("platform") for r in clean if r.get("queries_with_mention", 0) > 0],
+            "platforms_absent": [r.get("platform") for r in clean if r.get("queries_with_mention", 0) == 0],
             "dominant_sentiment": "neutral",
-            "summary": f"Initial analysis for {brand} shows moderate visibility across tested platforms.",
-            "platform_analyses": [{"platform": p, "verdict": "moderate", "analysis": "Data retrieved but advanced synthesis is currently in fallback mode."} for p in ["perplexity", "chatgpt", "bing"]],
-            "geo_recommendations": ["Optimize brand citations", "Improve category ranking", "Monitor platform results daily"]
+            "summary": f"Analysis unavailable. {brand} was scanned across {len(clean)} platforms.",
+            "platform_analyses": [
+                {"platform": r.get("platform", "unknown"), "verdict": "moderate", "analysis": "Analysis temporarily unavailable."}
+                for r in clean
+            ],
+            "geo_recommendations": [
+                "Optimize brand citations on authoritative sources",
+                "Improve category ranking signals",
+                "Monitor platform results regularly"
+            ]
         }
-        

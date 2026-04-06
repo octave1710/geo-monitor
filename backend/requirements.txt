@@ -1,5 +1,5 @@
-tinyfish
-anthropic
-python-dotenv
-fastapi
-uvicorn
+tinyfish==0.2.3
+anthropic==0.86.0
+fastapi==0.135.1
+uvicorn==0.42.0
+python-dotenv>=1.0.0

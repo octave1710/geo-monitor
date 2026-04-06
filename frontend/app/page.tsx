@@ -226,40 +226,60 @@ export default function Home() {
     setShowScore(false);
     setStatus(demo ? 'Running demo scan...' : 'Generating search queries...');
 
+    let totalPlatforms = 3;
+    let receivedComplete = false;
+
     try {
       const url = `${BACKEND}/api/scan/${encodeURIComponent(effectiveBrand)}${demo ? '?demo=true' : ''}`;
       const res = await fetch(url);
-      const reader = res.body!.getReader();
+      if (!res.ok || !res.body) {
+        setStatus(`Server error (${res.status})`);
+        setLoading(false);
+        return;
+      }
+      const reader = res.body.getReader();
       const decoder = new TextDecoder();
       const collectedPlatforms: PlatformResult[] = [];
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
-        for (const line of lines) {
-          const data = JSON.parse(line.replace('data: ', ''));
-          if (data.type === 'started') setStatus('Scanning AI platforms...');
-          if (data.type === 'queries') {
-            setQueries(data.queries);
-            setStatus(`Testing ${data.queries.length} queries across platforms...`);
-          }
-          if (data.type === 'platform_done') {
-            collectedPlatforms.push(data.result);
-            setPlatforms([...collectedPlatforms]);
-            setStatus(`${collectedPlatforms.length}/3 platforms complete`);
-          }
-          if (data.type === 'complete') {
-            setResult({ score: data.score, platforms: collectedPlatforms, queries: [] });
-            setStatus('');
-            // Delay score reveal for dramatic effect
-            setTimeout(() => {
-              setShowScore(true);
-              scoreRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }, 300);
-          }
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.replace('data: ', ''));
+            if (data.type === 'started') {
+              totalPlatforms = data.platforms?.length || 3;
+              setStatus('Scanning AI platforms...');
+            }
+            if (data.type === 'queries') {
+              setQueries(data.queries);
+              setStatus(`Testing ${data.queries.length} queries across platforms...`);
+            }
+            if (data.type === 'platform_done') {
+              collectedPlatforms.push(data.result);
+              setPlatforms([...collectedPlatforms]);
+              setStatus(`${collectedPlatforms.length}/${totalPlatforms} platforms complete`);
+            }
+            if (data.type === 'complete') {
+              receivedComplete = true;
+              setResult({ score: data.score, platforms: collectedPlatforms, queries: [] });
+              setStatus('');
+              setTimeout(() => {
+                setShowScore(true);
+                scoreRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 300);
+            }
+          } catch { /* skip malformed SSE events */ }
         }
+      }
+      if (!receivedComplete) {
+        setStatus('Connection lost during scan. Please try again.');
       }
     } catch {
       setStatus('Connection error — check backend is running');
@@ -267,8 +287,9 @@ export default function Home() {
     setLoading(false);
   };
 
+  const allPlatformKeys = ['perplexity', 'chatgpt', 'bing'];
   const pendingPlatforms = loading
-    ? ['perplexity', 'chatgpt', 'bing'].filter(p => !platforms.find(r => r.platform === p))
+    ? allPlatformKeys.filter(p => !platforms.find(r => r.platform === p))
     : [];
 
   return (

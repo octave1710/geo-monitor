@@ -1,21 +1,28 @@
 import asyncio
 import json
-from fastapi import FastAPI, Query
+
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from geo_agent import scan_platform_with_timeout, generate_queries, PLATFORMS
-from synthesizer import compute_score
 from dotenv import load_dotenv
 
 load_dotenv()
 
+from geo_agent import scan_platform_with_timeout, generate_queries, validate_brand, PLATFORMS
+from synthesizer import compute_score
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://geo-monitor-coral.vercel.app",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+SSE_POLL_TIMEOUT = 15
 
 DEMO_QUERIES = [
     "best running shoes 2025",
@@ -26,6 +33,7 @@ DEMO_QUERIES = [
 DEMO_PLATFORMS = [
     {
         "platform": "perplexity",
+        "brand": "Nike",
         "mention_rate": 33,
         "sentiment": "neutral",
         "snippet": "Nike React Infinity Run Flyknit recommended for daily training.",
@@ -40,6 +48,7 @@ DEMO_PLATFORMS = [
     },
     {
         "platform": "chatgpt",
+        "brand": "Nike",
         "mention_rate": 66,
         "sentiment": "positive",
         "snippet": "Nike Air Max 270 consistently ranks among top athletic shoes.",
@@ -54,6 +63,7 @@ DEMO_PLATFORMS = [
     },
     {
         "platform": "bing",
+        "brand": "Nike",
         "mention_rate": 100,
         "sentiment": "positive",
         "snippet": "Nike leads comfort rankings across major sport retailers.",
@@ -78,17 +88,17 @@ DEMO_SCORE = {
         {
             "platform": "perplexity",
             "verdict": "weak",
-            "analysis": "Nike only appeared in 1 of 3 category searches. Perplexity tends to cite academic and review sources — the brand may lack structured data in those domains.",
+            "analysis": "Nike only appeared in 1 of 3 category searches. Perplexity tends to cite academic and review sources.",
         },
         {
             "platform": "chatgpt",
             "verdict": "moderate",
-            "analysis": "Nike was mentioned in 2 of 3 searches with positive framing. ChatGPT positioned Nike alongside competitors, suggesting good but not dominant visibility.",
+            "analysis": "Nike was mentioned in 2 of 3 searches with positive framing alongside competitors.",
         },
         {
             "platform": "bing",
             "verdict": "strong",
-            "analysis": "Nike appeared in all 3 category searches with strong positive sentiment. Bing Copilot clearly pulls Nike data from retail and review aggregators.",
+            "analysis": "Nike appeared in all 3 category searches with strong positive sentiment.",
         },
     ],
     "geo_recommendations": [
@@ -101,6 +111,12 @@ DEMO_SCORE = {
 
 @app.get("/api/scan/{brand}")
 async def scan_brand(brand: str, demo: bool = Query(default=False)):
+    # Validate brand name
+    try:
+        brand = validate_brand(brand)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     async def stream_demo():
         yield f"data: {json.dumps({'type': 'started', 'platforms': list(PLATFORMS.keys())})}\n\n"
 
@@ -115,7 +131,8 @@ async def scan_brand(brand: str, demo: bool = Query(default=False)):
     async def stream():
         yield f"data: {json.dumps({'type': 'started', 'platforms': list(PLATFORMS.keys())})}\n\n"
 
-        queries = generate_queries(brand)
+        loop = asyncio.get_event_loop()
+        queries = await loop.run_in_executor(None, generate_queries, brand)
         yield f"data: {json.dumps({'type': 'queries', 'queries': queries})}\n\n"
 
         tasks = {p: asyncio.create_task(scan_platform_with_timeout(p, brand, queries)) for p in PLATFORMS}
@@ -124,7 +141,7 @@ async def scan_brand(brand: str, demo: bool = Query(default=False)):
         pending = set(tasks.values())
 
         while pending:
-            done, pending = await asyncio.wait(pending, timeout=15, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(pending, timeout=SSE_POLL_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 result = await task
                 results.append(result)
@@ -132,7 +149,7 @@ async def scan_brand(brand: str, demo: bool = Query(default=False)):
             if pending:
                 yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
 
-        score = compute_score(results, brand)
+        score = await loop.run_in_executor(None, compute_score, results, brand)
         yield f"data: {json.dumps({'type': 'complete', 'score': score})}\n\n"
 
     return StreamingResponse(

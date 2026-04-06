@@ -1,13 +1,16 @@
 import asyncio
 import json
-from tinyfish import AsyncTinyFish
+import os
+import re
+from collections import Counter
+
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from tinyfish import AsyncTinyFish
 
 load_dotenv()
 
 client = AsyncTinyFish()
-import os
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 PLATFORMS = {
@@ -16,14 +19,18 @@ PLATFORMS = {
     "bing": "https://bing.com",
 }
 
+QUERY_TIMEOUT = 90
+PLATFORM_TIMEOUT = 100
+
+
 def generate_queries(brand: str) -> list:
     try:
         msg = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": f"""Generate 3 search queries for the general product CATEGORY that '{brand}' operates in.
+            messages=[{
+                "role": "user",
+                "content": f"""Generate 3 search queries for the general product CATEGORY that '{brand}' operates in.
 
 STRICT RULES:
 - Do NOT mention '{brand}' or ANY of its product names, sub-brands, or trademarks
@@ -34,17 +41,31 @@ STRICT RULES:
 
 Return ONLY a JSON array of 3 strings, no other text, no markdown.
 Example for Nike: ["best running shoes 2025", "top athletic footwear brands compared", "most comfortable sneakers for daily wear"]"""
-        }]
-    )
+            }]
+        )
         raw_text = msg.content[0].text
         if "```json" in raw_text:
             raw_text = raw_text.split("```json", 1)[1].split("```", 1)[0].strip()
         elif "```" in raw_text:
             raw_text = raw_text.split("```", 1)[1].split("```", 1)[0].strip()
-        return json.loads(raw_text)
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, list) or len(parsed) != 3 or not all(isinstance(q, str) for q in parsed):
+            raise ValueError(f"Unexpected query format: {parsed}")
+        return parsed
     except Exception as e:
-        print(f"Query generation fallback due to error: {e}")
+        print(f"Query generation fallback: {type(e).__name__}")
         return ["best products in this category 2025", "top brands comparison review", "most recommended options for everyday use"]
+
+
+def validate_brand(brand: str) -> str:
+    """Validate and sanitize brand name input."""
+    brand = brand.strip()
+    if not brand or len(brand) > 100:
+        raise ValueError("Brand name must be 1-100 characters")
+    if not re.match(r'^[a-zA-Z0-9\s\-\.&\'\u00C0-\u024F]+$', brand):
+        raise ValueError("Brand name contains invalid characters")
+    return brand
+
 
 async def scan_single_query(platform: str, brand: str, query: str) -> dict:
     try:
@@ -53,48 +74,48 @@ async def scan_single_query(platform: str, brand: str, query: str) -> dict:
                 url=PLATFORMS[platform],
                 goal=f"Search for '{query}'. When results fully load, read the ENTIRE response carefully. Check if '{brand}' is mentioned anywhere in the text. Return only JSON: {{\"mentioned\": true/false, \"snippet\": \"exact sentence mentioning {brand} or null\", \"sentiment\": \"positive or neutral or negative based on the tone of the mention\"}}"
             ),
-            timeout=90
+            timeout=QUERY_TIMEOUT
         )
         raw = response.result
         if not raw:
-            return {"query": query, "mentioned": False, "snippet": None}
+            return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
         if isinstance(raw, str):
             raw = raw.replace("```json", "").replace("```", "").strip()
             result = json.loads(raw)
-            result.setdefault("query", query)
-            return result
-        return raw
+            return {
+                "query": query,
+                "mentioned": bool(result.get("mentioned", False)),
+                "snippet": result.get("snippet"),
+                "sentiment": result.get("sentiment", "neutral"),
+            }
+        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral"}
     except asyncio.TimeoutError:
-        return {"query": query, "mentioned": False, "snippet": None, "error": "timeout"}
-    except Exception as e:
-        return {"query": query, "mentioned": False, "snippet": None, "error": str(e)}
+        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "timeout"}
+    except Exception:
+        return {"query": query, "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "scan_failed"}
+
 
 async def scan_platform(platform: str, brand: str, queries: list) -> dict:
     query_results = await asyncio.gather(
         *[scan_single_query(platform, brand, q) for q in queries],
         return_exceptions=True
     )
-    # Filter out exceptions, treat them as no-mention
     clean_results = []
     for i, r in enumerate(query_results):
         if isinstance(r, Exception):
-            clean_results.append({"query": queries[i], "mentioned": False, "snippet": None, "error": str(r)})
+            clean_results.append({"query": queries[i], "mentioned": False, "snippet": None, "sentiment": "neutral", "error": "exception"})
         else:
             clean_results.append(r)
 
     mentions = [r for r in clean_results if r.get("mentioned")]
     total_queries = len(queries)
-    mention_rate = int((len(mentions) / total_queries) * 100)
+    mention_rate = int((len(mentions) / total_queries) * 100) if total_queries > 0 else 0
     snippets = [r.get("snippet") for r in mentions if r.get("snippet")]
 
-    # Determine sentiment from actual snippet content when available
+    # Determine sentiment from actual snippet content
     if mentions:
         sentiments = [r.get("sentiment", "neutral") for r in mentions if r.get("sentiment")]
-        if sentiments:
-            from collections import Counter
-            sentiment = Counter(sentiments).most_common(1)[0][0]
-        else:
-            sentiment = "positive"
+        sentiment = Counter(sentiments).most_common(1)[0][0] if sentiments else "positive"
     else:
         sentiment = "negative"
 
@@ -111,9 +132,10 @@ async def scan_platform(platform: str, brand: str, queries: list) -> dict:
         "query_results": clean_results,
     }
 
+
 async def scan_platform_with_timeout(platform: str, brand: str, queries: list) -> dict:
     try:
-        return await asyncio.wait_for(scan_platform(platform, brand, queries), timeout=100)
+        return await asyncio.wait_for(scan_platform(platform, brand, queries), timeout=PLATFORM_TIMEOUT)
     except asyncio.TimeoutError:
         return {
             "platform": platform,
@@ -127,9 +149,3 @@ async def scan_platform_with_timeout(platform: str, brand: str, queries: list) -
             "snippet": None,
             "query_results": [],
         }
-
-async def scan_all(brand: str) -> dict:
-    queries = generate_queries(brand)
-    tasks = [scan_platform_with_timeout(p, brand, queries) for p in PLATFORMS]
-    results = await asyncio.gather(*tasks)
-    return {"queries": queries, "results": list(results)}
